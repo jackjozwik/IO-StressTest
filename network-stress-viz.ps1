@@ -1,7 +1,7 @@
 # Network Stress Test Visualizer
 param(
     [Parameter(Mandatory=$true)]
-    [string]$DataPath      # Path to the test results directory containing summary_results.csv
+    [string]$DataPath
 )
 
 # Import results
@@ -11,18 +11,69 @@ if (-not (Test-Path $summaryPath)) {
     exit 1
 }
 
-# Parse each computer's results.txt file
+# Parse results and performance data
 $results = @()
 $computerDirs = Get-ChildItem -Path $DataPath -Directory
 
 foreach ($dir in $computerDirs) {
     $resultsFile = Join-Path $dir.FullName "results.txt"
+    $perfCountersFile = Join-Path $dir.FullName "perfcounters.csv"
+    
     if (Test-Path $resultsFile) {
         $content = Get-Content $resultsFile -Raw
         
-        # Extract throughput using regex
+        # Extract DiskSpd metrics
         $throughputMatch = [regex]::Match($content, "total:\s+\d+\s+\|\s+\d+\s+\|\s+(\d+\.\d+)\s+\|")
         $iopsMatch = [regex]::Match($content, "\|\s+(\d+\.\d+)\s+\|\s+0\.0")
+        
+        $perfMetrics = @{}
+        if (Test-Path $perfCountersFile) {
+            # Read the CSV content
+            $csvContent = Get-Content $perfCountersFile
+            
+            # Extract header line and clean up quotes
+            $header = $csvContent[0] -replace '"', ''
+            # Get column names
+            $columns = $header.Split(',')
+            
+            # Read data, skipping first two lines (header and empty data line)
+            $data = $csvContent[2..($csvContent.Count-1)] | ForEach-Object {
+                $line = $_ -replace '"', ''
+                $values = $line.Split(',')
+                $result = @{}
+                for ($i = 0; $i -lt $columns.Count; $i++) {
+                    if ($i -lt $values.Count) {
+                        $result[$columns[$i]] = $values[$i]
+                    }
+                }
+                [PSCustomObject]$result
+            }
+            
+            # Calculate averages for each metric
+            $metrics = @{
+                'IO Read Ops' = '*io read operations/sec*'
+                'IO Write Ops' = '*io write operations/sec*'
+                'Handle Count' = '*handle count*'
+                'IO Read Bytes' = '*io read bytes/sec*'
+                'IO Write Bytes' = '*io write bytes/sec*'
+            }
+            
+            foreach ($metric in $metrics.Keys) {
+                try {
+                    $column = $columns | Where-Object { $_ -like $metrics[$metric] }
+                    if ($column) {
+                        $values = $data.$column | Where-Object { $_ -ne ' ' } | ForEach-Object { [double]$_ }
+                        if ($values) {
+                            $avg = ($values | Measure-Object -Average).Average
+                            $perfMetrics[$metric] = $avg
+                        }
+                    }
+                }
+                catch {
+                    Write-Warning "Error processing $metric for $($dir.Name): $_"
+                }
+            }
+        }
         
         if ($throughputMatch.Success) {
             $throughput = [double]$throughputMatch.Groups[1].Value
@@ -32,14 +83,19 @@ foreach ($dir in $computerDirs) {
                 ComputerName = $dir.Name
                 ConcurrentMachines = [array]::IndexOf($computerDirs.Name, $dir.Name) + 1
                 AverageThroughput = $throughput
-                PeakThroughput = $throughput * 1.1  # Estimating peak as 10% higher
+                PeakThroughput = $throughput * 1.1
                 IOPS = $iops
+                IOReadOps = [math]::Round($perfMetrics['IO Read Ops'], 2)
+                IOWriteOps = [math]::Round($perfMetrics['IO Write Ops'], 2)
+                HandleCount = [math]::Round($perfMetrics['Handle Count'], 2)
+                ReadBytesPerSec = [math]::Round($perfMetrics['IO Read Bytes'] / 1MB, 2)
+                WriteBytesPerSec = [math]::Round($perfMetrics['IO Write Bytes'] / 1MB, 2)
             }
         }
     }
 }
 
-# Sort results by concurrent machines
+# Sort results
 $results = $results | Sort-Object ConcurrentMachines
 
 # Create visualization
@@ -53,7 +109,7 @@ $htmlReport = @"
     <title>Network Stress Test Results</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        body { font-family: Arial, sans-serif; margin: 20px; max-width: 1200px; margin: 0 auto; }
+        body { font-family: Arial, sans-serif; margin: 20px; max-width: 1400px; margin: 0 auto; }
         .chart-container { width: 100%; height: 400px; margin: 20px 0; }
         table { border-collapse: collapse; width: 100%; margin: 20px 0; }
         th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
@@ -73,11 +129,15 @@ $htmlReport = @"
     </div>
     
     <div class="chart-container">
-        <canvas id="performanceChart"></canvas>
+        <canvas id="throughputChart"></canvas>
     </div>
     
     <div class="chart-container">
-        <canvas id="iopsChart"></canvas>
+        <canvas id="ioOpsChart"></canvas>
+    </div>
+    
+    <div class="chart-container">
+        <canvas id="handleCountChart"></canvas>
     </div>
     
     <div>
@@ -89,6 +149,11 @@ $htmlReport = @"
                 <th>Average Throughput (MB/s)</th>
                 <th>Peak Throughput (MB/s)</th>
                 <th>IOPS</th>
+                <th>IO Read Ops/sec</th>
+                <th>IO Write Ops/sec</th>
+                <th>Handle Count</th>
+                <th>Read MB/sec</th>
+                <th>Write MB/sec</th>
             </tr>
             $(foreach ($result in $results) {
                 "<tr>
@@ -97,14 +162,18 @@ $htmlReport = @"
                     <td>$([math]::Round($result.AverageThroughput, 2))</td>
                     <td>$([math]::Round($result.PeakThroughput, 2))</td>
                     <td>$([math]::Round($result.IOPS, 2))</td>
+                    <td>$($result.IOReadOps)</td>
+                    <td>$($result.IOWriteOps)</td>
+                    <td>$($result.HandleCount)</td>
+                    <td>$($result.ReadBytesPerSec)</td>
+                    <td>$($result.WriteBytesPerSec)</td>
                 </tr>"
             })
         </table>
     </div>
     
     <script>
-        const ctx = document.getElementById('performanceChart');
-        const iopsCtx = document.getElementById('iopsChart');
+        const ctx = document.getElementById('throughputChart');
         
         new Chart(ctx, {
             type: 'line',
@@ -149,14 +218,19 @@ $htmlReport = @"
             }
         });
 
-        new Chart(iopsCtx, {
+        new Chart(document.getElementById('ioOpsChart'), {
             type: 'line',
             data: {
                 labels: [$(($results.ConcurrentMachines | ForEach-Object { $_ }) -join ',')],
                 datasets: [{
-                    label: 'IOPS',
-                    data: [$(($results.IOPS | ForEach-Object { $_ }) -join ',')],
+                    label: 'IO Read Operations/sec',
+                    data: [$(($results.IOReadOps | ForEach-Object { $_ }) -join ',')],
                     borderColor: 'rgb(153, 102, 255)',
+                    tension: 0.1
+                }, {
+                    label: 'IO Write Operations/sec',
+                    data: [$(($results.IOWriteOps | ForEach-Object { $_ }) -join ',')],
+                    borderColor: 'rgb(255, 159, 64)',
                     tension: 0.1
                 }]
             },
@@ -168,7 +242,7 @@ $htmlReport = @"
                         beginAtZero: true,
                         title: {
                             display: true,
-                            text: 'IO Operations per Second'
+                            text: 'Operations/sec'
                         }
                     },
                     x: {
@@ -181,7 +255,45 @@ $htmlReport = @"
                 plugins: {
                     title: {
                         display: true,
-                        text: 'IOPS Performance Chart'
+                        text: 'IO Operations Performance'
+                    }
+                }
+            }
+        });
+
+        new Chart(document.getElementById('handleCountChart'), {
+            type: 'line',
+            data: {
+                labels: [$(($results.ConcurrentMachines | ForEach-Object { $_ }) -join ',')],
+                datasets: [{
+                    label: 'Handle Count',
+                    data: [$(($results.HandleCount | ForEach-Object { $_ }) -join ',')],
+                    borderColor: 'rgb(75, 192, 75)',
+                    tension: 0.1
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {
+                    y: {
+                        beginAtZero: true,
+                        title: {
+                            display: true,
+                            text: 'Handles'
+                        }
+                    },
+                    x: {
+                        title: {
+                            display: true,
+                            text: 'Number of Concurrent Machines'
+                        }
+                    }
+                },
+                plugins: {
+                    title: {
+                        display: true,
+                        text: 'Handle Count Over Time'
                     }
                 }
             }

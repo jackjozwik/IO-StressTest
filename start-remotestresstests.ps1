@@ -1,6 +1,6 @@
 # File: Start-NetworkStressTest.ps1
 param(
-    [Parameter(Mandatory=$true)]
+    [Parameter(Mandatory = $true)]
     [string]$ExcelPath,
     [int]$BaselineDuration = 600,
     [int]$StaggerDelay = 10,
@@ -44,11 +44,11 @@ if ($confirm -ne "Y") {
 }
 
 # Start tests with staggered delays
-foreach ($index in 0..($computers.Count-1)) {
+foreach ($index in 0..($computers.Count - 1)) {
     $computer = $computers[$index]
     $startDelay = $index * $StaggerDelay
     
-    Write-Host "Starting test on $computer (delay: $startDelay seconds)"
+    Write-Host "Starting test on $computer (Computer $($index + 1) of $($computers.Count))"
     
     Start-Job -ScriptBlock {
         param($Computer, $Delay, $Duration, $Size, $TimeStamp)
@@ -65,25 +65,84 @@ foreach ($index in 0..($computers.Count-1)) {
             $diskspd = "C:\ProgramData\NetworkTools\diskspd.exe"
             $testFile = Join-Path $testPath "test.dat"
             $outputFile = Join-Path $testPath "results.txt"
+            $perfCounterFile = Join-Path $testPath "perfcounters.csv"
             
             # Log start
             "Starting test at $(Get-Date)" | Out-File "$testPath\log.txt"
+
+            # First start DiskSpd in background
+            $diskspdProc = Start-Process -FilePath $diskspd -ArgumentList "-c${Size}G -d$Duration -r -t1 -b4K -L -o32 -W15 -D -Suw $testFile" -NoNewWindow -PassThru -RedirectStandardOutput $outputFile
             
-            # Run DiskSpd with the working command structure
-            $cmd = "& '$diskspd' -c${Size}G -d$Duration -r -t1 -b4K -L -o32 -W15 -D -Suw '$testFile' > '$outputFile' 2>&1"
-            "Running command: $cmd" | Out-File "$testPath\log.txt" -Append
+            # Wait a moment for the process to fully start
+            Start-Sleep -Seconds 5
+
+            # Define performance counters (using specific process instance)
+            $counters = @(
+                "\Memory\Available MBytes",
+                "\PhysicalDisk(_Total)\Disk Read Bytes/sec",
+                "\PhysicalDisk(_Total)\Disk Write Bytes/sec"
+            )
             
-            Invoke-Expression $cmd
+            # Add process-specific counters now that we have the PID
+            $counters = @(
+                "\Process(diskspd)\IO Read Operations/sec",
+                "\Process(diskspd)\IO Write Operations/sec",
+                "\Process(diskspd)\Handle Count",
+                "\Process(diskspd)\IO Read Bytes/sec",
+                "\Process(diskspd)\IO Write Bytes/sec",
+                "\PhysicalDisk(_Total)\Disk Read Bytes/sec",
+                "\PhysicalDisk(_Total)\Disk Write Bytes/sec"
+            )
+            $counters += $processCounters
             
-            # Log completion and verify results
-            "Test completed at $(Get-Date)" | Out-File "$testPath\log.txt" -Append
+            "Starting performance counter collection at $(Get-Date)" | Out-File "$testPath\log.txt" -Append
             
-            if (Test-Path $outputFile) {
-                $content = Get-Content $outputFile
-                "Results file has $($content.Count) lines" | Out-File "$testPath\log.txt" -Append
-            } else {
-                "ERROR: Results file was not created" | Out-File "$testPath\log.txt" -Append
+            # Collect counters for the duration
+            $counterData = Get-Counter -Counter $counters -SampleInterval 1 -MaxSamples $Duration
+            $counterData | Export-Counter -FileFormat CSV -Path $perfCounterFile -Force
+
+            
+            # Wait for DiskSpd to finish if it hasn't already
+            $diskspdProc | Wait-Process
+            
+            # Parse performance counter data
+            if (Test-Path $perfCounterFile) {
+                $countersCSV = Import-Csv $perfCounterFile
+                
+                # Calculate averages (using try-catch for each metric)
+                $summary = @{}
+                
+                foreach ($metric in @(
+                        'IO Read Operations/sec',
+                        'IO Write Operations/sec',
+                        'Handle Count',
+                        'Working Set',
+                        '% Processor Time',
+                        'Available MBytes',
+                        'Disk Read Bytes/sec',
+                        'Disk Write Bytes/sec'
+                    )) {
+                    try {
+                        $column = $countersCSV.PSObject.Properties | 
+                        Where-Object { $_.Name -like "*$metric" } |
+                        Select-Object -First 1 -ExpandProperty Name
+                        
+                        if ($column) {
+                            $avg = ($countersCSV.$column | Measure-Object -Average).Average
+                            $summary["Avg$($metric -replace '[^a-zA-Z0-9]', '')"] = $avg
+                        }
+                    }
+                    catch {
+                        "Error processing $metric : $_" | Out-File "$testPath\log.txt" -Append
+                    }
+                }
+                
+                # Save summary
+                $summary | ConvertTo-Json | Out-File -FilePath "$testPath\perf_summary.json"
             }
+            
+            # Log completion
+            "Test completed at $(Get-Date)" | Out-File "$testPath\log.txt" -Append
             
         } -ArgumentList $Duration, $Size, $TimeStamp
         
